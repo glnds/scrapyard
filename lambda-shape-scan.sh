@@ -241,15 +241,16 @@ SKIPS="$(mktemp)"
 trap 'rm -f "$RAW" "$ROWS" "$SKIPS"' EXIT
 : > "$ROWS"; : > "$SKIPS"
 
-# Severity: URGENT > TAIL > BIMODAL > MIXED > MILD > HEALTHY.
+# Severity: URGENT > UNEVEN > TAIL > HEALTHY.
+# Ordered by ratio magnitude: UNEVEN (> 10×) outranks TAIL (5–10×). The
+# cold-start asterisk already de-emphasises UNEVEN rows whose tail is
+# probably cold starts, so magnitude can drive rank without double-counting.
 # Used for sort order only — rank N prefixed to each row, stripped before print.
 rank_of() {
   case "$1" in
     URGENT)  echo 1 ;;
-    TAIL)    echo 2 ;;
-    UNEVEN)  echo 3 ;;
-    MIXED)   echo 4 ;;
-    MILD)    echo 5 ;;
+    UNEVEN)  echo 2 ;;
+    TAIL)    echo 3 ;;
     HEALTHY) echo 6 ;;
     *)       echo 9 ;;
   esac
@@ -330,8 +331,8 @@ echo
 echo "  Scanned $FN_COUNT function(s): $CLASSIFIED classified, $SKIPPED below sample threshold."
 echo
 (( URGENT_N  > 0 )) && echo "  $URGENT_N  ${RED}URGENT${RESET}   → calls time out and fail. 100% of that Duration is pure waste."
-(( TAIL_N    > 0 )) && echo "  $TAIL_N  ${YELLOW}TAIL${RESET}     → ~1% of calls take 5–10× longer — paying for wait-time (retries, DB, slow API)."
 (( UNEVEN_N  > 0 )) && echo "  $UNEVEN_N  ${YELLOW}UNEVEN${RESET}   → ~1% of calls take 10×+ longer — paying for cold starts or a rare slow input path."
+(( TAIL_N    > 0 )) && echo "  $TAIL_N  ${YELLOW}TAIL${RESET}     → ~1% of calls take 5–10× longer — paying for wait-time (retries, DB, slow API)."
 if (( HEALTHY_N > 0 )); then
   if (( SHOW_HEALTHY == 1 )); then
     echo "  $HEALTHY_N  ${GREEN}HEALTHY${RESET}  → calls take about the same time every run — you're paying for compute, not waiting."
