@@ -44,23 +44,25 @@ Options:
 
 ### Verdict categories
 
-| Verdict   | Condition                     | Meaning                                         |
-| --------- | ----------------------------- | ----------------------------------------------- |
-| `HEALTHY` | ratio < 5x or p99 < gap-floor | Paying for compute, not waiting                 |
-| `TAIL`    | 5x <= ratio <= 10x            | ~1% of calls 5-10x slower — retries/downstream  |
-| `UNEVEN`  | ratio > 10x                   | ~1% of calls 10x+ slower — cold starts/input    |
-| `URGENT`  | cliff >= 80%                  | p99 at timeout wall — calls are failing         |
+| Verdict   | Condition                     | Meaning                                            |
+| --------- | ----------------------------- | -------------------------------------------------- |
+| `HEALTHY` | ratio < 5x or p99 < gap-floor | Paying for compute, not waiting                    |
+| `TAIL`    | 5x <= ratio <= 10x            | ~1% of calls 5-10x slower — retries/downstream     |
+| `UNEVEN`  | ratio > 10x                   | ~1% of calls 10x+ slower — cold starts/input       |
+| `URGENT`  | cliff >= 80%                  | p99 at timeout wall — calls are failing            |
+| `URGENT`  | err >= 1 AND cliff >= 50%     | errors observed near the wall — timeouts confirmed |
 
 A `*` suffix means freq < 100/day: the tail is likely cold starts, not real wait-time waste.
 
 ### Output signals
 
-| Signal  | Formula           | Rule of thumb                               |
-| ------- | ----------------- | ------------------------------------------- |
-| `freq`  | invocations / day | >= 1000/d always-warm                       |
-| `ratio` | p99 / p50         | < 5x fine / 5-10x investigate / > 10x skewed|
-| `gap`   | (max-p99) / p99   | < 20% good / large = single freak outlier   |
-| `cliff` | p99 / timeout     | < 30% good / >= 80% at the timeout wall     |
+| Signal  | Formula           | Rule of thumb                                             |
+| ------- | ----------------- | --------------------------------------------------------- |
+| `freq`  | invocations / day | >= 1000/d always-warm                                     |
+| `ratio` | p99 / p50         | < 5x fine / 5-10x investigate / > 10x skewed              |
+| `gap`   | (max-p99) / p99   | < 20% good / large = single freak outlier                 |
+| `cliff` | p99 / timeout     | < 30% good / >= 80% at the timeout wall                   |
+| `err`   | Sum of Errors     | 0 = clean / >= 1 = some failure (timeout, exception, OOM) |
 
 ### Example
 

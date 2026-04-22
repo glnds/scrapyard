@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # lambda-shape-scan: classify every Lambda in an account by its duration distribution.
 #
-# Pulls p50/p90/p99/Max of the AWS/Lambda `Duration` metric from CloudWatch
-# GetMetricData (one API call, regardless of log group layout), then classifies
-# each function by the p99/p50 ratio and how close p99 sits to the timeout.
+# Pulls p50/p90/p99/Max of the AWS/Lambda `Duration` metric AND Sum of the
+# `Errors` metric from CloudWatch GetMetricData (one API call, regardless of
+# log group layout), then classifies each function by the p99/p50 ratio and
+# how close p99 sits to the timeout, plus whether errors hit the wall.
 #
 # Classifier (relaxed vs. the post — matches industry consensus that < 5x
 # is the healthy band, 5–10x is a wide tail worth a look, > 10x is skewed):
+#   err >= 1 AND cliff >= 50%      -> URGENT   (errors observed near the timeout wall — timeouts confirmed)
 #   p99 < --gap-floor              -> HEALTHY  (metric granularity, nothing to save)
 #   cliff >= 80%                   -> URGENT   (broken, invocations hitting the timeout)
 #   ratio > 10                     -> UNEVEN   (fast most runs, slow on some — mixed inputs / cold starts)
@@ -117,19 +119,29 @@ PERIOD=$((DAYS * 86400))
 # API-calling function — too strict for a real fleet. MILD is dropped.
 #
 # Rules (top-down):
+#   err >= 1 AND cliff >= 50%      -> URGENT   (errors observed near timeout — timeouts confirmed)
 #   p99 < --gap-floor              -> HEALTHY  (metric granularity, no waste)
 #   cliff >= 80%                   -> URGENT   (at the timeout wall, regardless of ratio)
 #   ratio > 10                     -> UNEVEN   (very skewed — cold starts, bimodal, outliers)
 #   ratio > 5                      -> TAIL     (wide tail worth investigating)
 #   else                           -> HEALTHY  (consistent enough — ratio < 5 is fine)
 #
+# Errors note: Lambda's Errors metric counts handler exceptions, OOM kills,
+# AND timeouts — they are not separated. When err > 0 AND cliff >= 50% the
+# tail is at the wall and at least one error happened, so the proximate
+# cause is almost certainly timeouts. err > 0 with low cliff means handler
+# exceptions or OOM, which the existing verdicts already classify by shape.
+#
 # Returns tab-separated: LABEL \t one-line-next-step.
 classify() {
-  local p50="$1" p99="$2" timeout_s="$3"
-  awk -v p50="$p50" -v p99="$p99" -v t="$timeout_s" -v floor="$GAP_FLOOR_MS" 'BEGIN{
+  local p50="$1" p99="$2" timeout_s="$3" err="$4"
+  awk -v p50="$p50" -v p99="$p99" -v t="$timeout_s" -v err="$err" \
+      -v floor="$GAP_FLOOR_MS" 'BEGIN{
     tms = t * 1000
     r = (p50 <= 0) ? 999 : p99 / p50
     f = (tms  <= 0) ? 0   : p99 / tms
+    if (err + 0 >= 1 && f >= 0.50) {
+      printf "URGENT\t%d error(s) with p99 at the wall — timeouts confirmed, fix first\n", err; exit }
     if (p99 + 0 < floor) {
       print "HEALTHY\teverything runs under " floor "ms — no waste to chase"; exit }
     if (f >= 0.80) {
@@ -159,25 +171,27 @@ echo "Window: ${DAYS}d ($START_ISO → $END_ISO) | Min invocations: $MIN_INVOCAT
 echo "Enumerated $FN_COUNT function(s). Calling CloudWatch GetMetricData..."
 
 # --- Build MetricDataQueries JSON ------------------------------------------
-# Five queries per function (p50, p90, p99, mx=Maximum, n=SampleCount).
-# Ids must match ^[a-z][a-zA-Z0-9_]*$ and be <= 255 chars. We use the
-# function's index to keep Ids short and safe regardless of function name.
+# Six queries per function (p50, p90, p99, mx=Maximum, n=SampleCount of
+# Duration; err=Sum of Errors). Ids must match ^[a-z][a-zA-Z0-9_]*$ and be
+# <= 255 chars. We use the function's index to keep Ids short and safe
+# regardless of function name.
 QUERIES_JSON=$(echo "$FN_JSON" | jq --argjson period "$PERIOD" '
   [.Functions | to_entries[] | . as $e
    | ($e.value.FunctionName) as $fn
    | [
-       {stat: "p50",         suf: "p50"},
-       {stat: "p90",         suf: "p90"},
-       {stat: "p99",         suf: "p99"},
-       {stat: "Maximum",     suf: "mx"},
-       {stat: "SampleCount", suf: "n"}
+       {ns: "AWS/Lambda", m: "Duration", stat: "p50",         suf: "p50"},
+       {ns: "AWS/Lambda", m: "Duration", stat: "p90",         suf: "p90"},
+       {ns: "AWS/Lambda", m: "Duration", stat: "p99",         suf: "p99"},
+       {ns: "AWS/Lambda", m: "Duration", stat: "Maximum",     suf: "mx"},
+       {ns: "AWS/Lambda", m: "Duration", stat: "SampleCount", suf: "n"},
+       {ns: "AWS/Lambda", m: "Errors",   stat: "Sum",         suf: "err"}
      ]
    | map({
        Id: ("q\($e.key)_\(.suf)"),
        MetricStat: {
          Metric: {
-           Namespace: "AWS/Lambda",
-           MetricName: "Duration",
+           Namespace: .ns,
+           MetricName: .m,
            Dimensions: [{Name: "FunctionName", Value: $fn}]
          },
          Period: $period,
@@ -248,7 +262,9 @@ echo "$MAP_JSON" | jq -r '.[] | [.idx, .fn, .timeout] | @tsv' \
       p99=$(awk -F'\t' -v k="q${idx}_p99" '$1==k{print $2}' "$RAW")
       mx=$( awk -F'\t' -v k="q${idx}_mx"  '$1==k{print $2}' "$RAW")
       n=$(  awk -F'\t' -v k="q${idx}_n"   '$1==k{print $2}' "$RAW")
+      err=$(awk -F'\t' -v k="q${idx}_err" '$1==k{print $2}' "$RAW")
       n_int=${n%.*}; n_int=${n_int:-0}
+      err_int=${err%.*}; err_int=${err_int:-0}
 
       if [[ "$n_int" -eq 0 ]]; then
         printf '%s\tno invocations in window\n' "$fn" >> "$SKIPS"; continue
@@ -257,7 +273,7 @@ echo "$MAP_JSON" | jq -r '.[] | [.idx, .fn, .timeout] | @tsv' \
         printf '%s\t%s invocations (<%s)\n' "$fn" "$n_int" "$MIN_INVOCATIONS" >> "$SKIPS"; continue
       fi
 
-      cls=$(classify "$p50" "$p99" "$timeout")
+      cls=$(classify "$p50" "$p99" "$timeout" "$err_int")
       label=${cls%%$'\t'*}
       rank=$(rank_of "$label")
 
@@ -288,8 +304,8 @@ echo "$MAP_JSON" | jq -r '.[] | [.idx, .fn, .timeout] | @tsv' \
         case "$label" in TAIL|UNEVEN|MIXED) cold="1" ;; esac
       fi
 
-      printf '%s\t%s\t%s\t%.0f\t%.0f\t%.0f\t%.0f\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$rank" "$label" "$fn" "$p50" "$p90" "$p99" "$mx" "$n_int" "$freq" "$ratio" "$gap" "$cliff" "$cold" "$timeout" \
+      printf '%s\t%s\t%s\t%.0f\t%.0f\t%.0f\t%.0f\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$rank" "$label" "$fn" "$p50" "$p90" "$p99" "$mx" "$n_int" "$freq" "$ratio" "$gap" "$cliff" "$cold" "$timeout" "$err_int" \
         >> "$ROWS"
     done
 
@@ -333,9 +349,9 @@ fi
 # Function names >44 chars are truncated with "…"; large n/freq values are
 # given generous columns so real-world payloads don't break alignment.
 echo
-printf '  %-50s %9s %9s %9s %10s %11s %12s %8s %7s %6s %6s   %s\n' \
-  "Function" "p50ms" "p90ms" "p99ms" "max" "n" "freq" "ratio" "gap" "wall" "cliff" "Verdict"
-printf '  %s\n' "$(printf '%.0s-' {1..165})"
+printf '  %-50s %9s %9s %9s %10s %11s %12s %8s %7s %6s %6s %7s   %s\n' \
+  "Function" "p50ms" "p90ms" "p99ms" "max" "n" "freq" "ratio" "gap" "wall" "cliff" "err" "Verdict"
+printf '  %s\n' "$(printf '%.0s-' {1..173})"
 
 sort -t$'\t' -k1,1n -k10,10 "$ROWS" \
   | awk -F'\t' \
@@ -366,6 +382,11 @@ sort -t$'\t' -k1,1n -k10,10 "$ROWS" \
       if (n >= 30) return yellow
       return green
     }
+    function cerr(s,   n) {
+      n = s + 0
+      if (n >= 1) return red
+      return green
+    }
     # cold-start-suspect rows (col 13 == "1") render in plain white — the
     # asterisk + freq red already flag the row; yellow would double-warn
     # for a finding that is probably NOT a real problem. URGENT stays red
@@ -383,13 +404,14 @@ sort -t$'\t' -k1,1n -k10,10 "$ROWS" \
       if ($13 == "1") verdict = verdict "*"
       fname = $3
       if (length(fname) > 50) fname = substr(fname, 1, 49) "…"
-      printf "  %-50s %9d %9d %9d %10d %11d %s%12s%s %s%8s%s %s%7s%s %s%6s%s %s%6s%s   %s%-8s%s\n",
+      printf "  %-50s %9d %9d %9d %10d %11d %s%12s%s %s%8s%s %s%7s%s %s%6s%s %s%6s%s %s%7s%s   %s%-8s%s\n",
         fname, $4, $5, $6, $7, $8,
         cfreq($9),    $9,  reset,
         cratio($10),  $10, reset,
         cgap($11),    $11, reset,
         blue, $14 "s", reset,
         ccliff($12),  $12, reset,
+        cerr($15),    $15, reset,
         cverdict($2, $13), verdict, reset
     }'
 
@@ -419,9 +441,13 @@ echo "  freq    invocations per day                                    ( ≥ 100
 echo "  ratio   how much slower the slow runs are vs. the fast runs   ( < 5x is fine, 5–10x worth a look, > 10x skewed )"
 echo "  gap     how extreme the single worst run is vs. the tail       ( < 20% is good; huge = one freak outlier )"
 echo "  cliff   how close the tail is to the configured timeout        ( < 30% is good; ≥ 80% = at the wall )"
+echo "  err     errored invocations in window (timeouts + exceptions + OOM, not separated)"
 echo
 echo "  freq red (< 100/d) + ratio red: the tail is probably cold starts, not a real wait-time pattern."
 echo "  Lambda keeps containers warm ~5–15 min; below ~100 invocations/day almost every run cold-starts."
+echo
+echo "  err > 0 + cliff ≥ 50% → timeouts confirmed (the tail hit the wall AND something failed)."
+echo "  err > 0 + low cliff   → handler exceptions or OOM — different waste class, not a timeout."
 echo
 echo "  Sub-${GAP_FLOOR_MS}ms p99 → gap shown as '-' and verdict defaults to HEALTHY."
 echo "  That size is metric granularity, not a real tail — no wait-time waste to find."
