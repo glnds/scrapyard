@@ -92,10 +92,10 @@ else
   USE_COLOR=0
 fi
 if (( USE_COLOR )); then
-  RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
+  RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[94m'
   BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
 else
-  RED=""; GREEN=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
+  RED=""; GREEN=""; YELLOW=""; BLUE=""; BOLD=""; DIM=""; RESET=""
 fi
 
 # --- Time window (UTC, ISO-8601) -------------------------------------------
@@ -207,7 +207,10 @@ while (( OFFSET < TOTAL_QS )); do
     --end-time "$END_ISO" \
     --metric-data-queries "$BATCH" \
     --output json \
-    | jq -r '.MetricDataResults[] | [.Id, (.Values[0] // 0)] | @tsv' >> "$RAW"
+    | jq -sr '[.[].MetricDataResults[]]
+              | group_by(.Id)[]
+              | [.[0].Id, ([.[].Values[0] // 0] | max)]
+              | @tsv' >> "$RAW"
   OFFSET=$((OFFSET + BATCH_SIZE))
 done
 
@@ -285,8 +288,8 @@ echo "$MAP_JSON" | jq -r '.[] | [.idx, .fn, .timeout] | @tsv' \
         case "$label" in TAIL|UNEVEN|MIXED) cold="1" ;; esac
       fi
 
-      printf '%s\t%s\t%s\t%.0f\t%.0f\t%.0f\t%.0f\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$rank" "$label" "$fn" "$p50" "$p90" "$p99" "$mx" "$n_int" "$freq" "$ratio" "$gap" "$cliff" "$cold" \
+      printf '%s\t%s\t%s\t%.0f\t%.0f\t%.0f\t%.0f\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$rank" "$label" "$fn" "$p50" "$p90" "$p99" "$mx" "$n_int" "$freq" "$ratio" "$gap" "$cliff" "$cold" "$timeout" \
         >> "$ROWS"
     done
 
@@ -330,13 +333,13 @@ fi
 # Function names >44 chars are truncated with "…"; large n/freq values are
 # given generous columns so real-world payloads don't break alignment.
 echo
-printf '  %-50s %9s %9s %9s %10s %11s %12s %8s %7s %6s   %s\n' \
-  "Function" "p50ms" "p90ms" "p99ms" "max" "n" "freq" "ratio" "gap" "cliff" "Verdict"
-printf '  %s\n' "$(printf '%.0s-' {1..158})"
+printf '  %-50s %9s %9s %9s %10s %11s %12s %8s %7s %6s %6s   %s\n' \
+  "Function" "p50ms" "p90ms" "p99ms" "max" "n" "freq" "ratio" "gap" "wall" "cliff" "Verdict"
+printf '  %s\n' "$(printf '%.0s-' {1..165})"
 
 sort -t$'\t' -k1,1n -k10,10 "$ROWS" \
   | awk -F'\t' \
-      -v red="$RED" -v green="$GREEN" -v yellow="$YELLOW" -v reset="$RESET" \
+      -v red="$RED" -v green="$GREEN" -v yellow="$YELLOW" -v blue="$BLUE" -v reset="$RESET" \
       -v show_healthy="$SHOW_HEALTHY" '
     function cfreq(s,   n) {
       n = s + 0   # "123/d" -> 123 via atof truncation at slash
@@ -380,11 +383,12 @@ sort -t$'\t' -k1,1n -k10,10 "$ROWS" \
       if ($13 == "1") verdict = verdict "*"
       fname = $3
       if (length(fname) > 50) fname = substr(fname, 1, 49) "…"
-      printf "  %-50s %9d %9d %9d %10d %11d %s%12s%s %s%8s%s %s%7s%s %s%6s%s   %s%-8s%s\n",
+      printf "  %-50s %9d %9d %9d %10d %11d %s%12s%s %s%8s%s %s%7s%s %s%6s%s %s%6s%s   %s%-8s%s\n",
         fname, $4, $5, $6, $7, $8,
         cfreq($9),    $9,  reset,
         cratio($10),  $10, reset,
         cgap($11),    $11, reset,
+        blue, $14 "s", reset,
         ccliff($12),  $12, reset,
         cverdict($2, $13), verdict, reset
     }'
